@@ -10,7 +10,6 @@ use rayon::prelude::*;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 /// 单条目压缩块读取上限（防御异常索引；实测条目远小于此值）。
 const MAX_ENTRY_COMP: u64 = 512 * 1024 * 1024;
@@ -25,12 +24,12 @@ fn main() {
 
 fn run(args: &Args) -> Result<()> {
     validate_modes(args)?;
+    // 未指定 -j 时 rayon 默认线程数 = 运行时逻辑 CPU 核数（自动适配）。
+    let mut builder = rayon::ThreadPoolBuilder::new();
     if let Some(j) = args.jobs {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(j)
-            .build_global()
-            .context("初始化线程池失败")?;
+        builder = builder.num_threads(j);
     }
+    builder.build_global().context("初始化线程池失败")?;
 
     if let Some(package) = &args.package {
         return run_single(args, package);
@@ -76,6 +75,7 @@ fn run_single(args: &Args, package: &Path) -> Result<()> {
 
     let lua_key = resolve_key(&args.launcher, package.parent(), args.no_lua_decrypt);
 
+    println!("并行线程：{}（-j 可指定）", rayon::current_num_threads());
     let pb = new_progress_bar(pkg.entries.len() as u64);
     let summary = extract_all(&pb, "", package, &pkg, &output, lua_key.as_deref())?;
     pb.finish_and_clear();
@@ -138,6 +138,7 @@ fn run_batch(args: &Args, root: &Path, kind: &str) -> Result<usize> {
 
     let lua_key = resolve_key(&args.launcher, Some(root), args.no_lua_decrypt);
 
+    println!("并行线程：{}（-j 可指定）", rayon::current_num_threads());
     let total_entries: u64 = parsed.iter().map(|(_, p)| p.entries.len() as u64).sum();
     let pb = new_progress_bar(total_entries);
     let mut total_failures = 0usize;
@@ -330,21 +331,31 @@ fn extract_all(
     output: &Path,
     lua_key: Option<&[u8]>,
 ) -> Result<PackageSummary> {
-    let shared = Mutex::new(
-        File::open(package_path).with_context(|| format!("打开 {} 失败", package_path.display()))?,
-    );
+    // 预检：打不开立即报错（保持批量模式"打开失败"的即时反馈）。
+    File::open(package_path)
+        .with_context(|| format!("打开 {} 失败", package_path.display()))?;
     let results: Vec<(String, Result<Outcome>)> = pkg
         .entries
         .par_iter()
-        .map(|e| {
-            let r = extract_entry(&shared, e, output, lua_key);
-            if r.is_ok() {
-                // wide_msg 会按终端宽度自动截断，这里只做粗上限。
-                pb.set_message(format!("{msg_prefix}{}", truncate(&e.name, 48)));
-            }
-            pb.inc(1);
-            (e.name.clone(), r)
-        })
+        // 每个工作线程独立文件句柄，读压缩块无需全局锁。
+        .map_init(
+            || File::open(package_path).ok(),
+            |file, e| {
+                let r = match file {
+                    Some(f) => extract_entry(f, e, output, lua_key),
+                    None => Err(anyhow::anyhow!(
+                        "线程内打开 {} 失败",
+                        package_path.display()
+                    )),
+                };
+                if r.is_ok() {
+                    // wide_msg 会按终端宽度自动截断，这里只做粗上限。
+                    pb.set_message(format!("{msg_prefix}{}", truncate(&e.name, 48)));
+                }
+                pb.inc(1);
+                (e.name.clone(), r)
+            },
+        )
         .collect();
 
     let mut s = PackageSummary {
@@ -410,7 +421,7 @@ enum Outcome {
 }
 
 fn extract_entry(
-    shared: &Mutex<File>,
+    file: &mut File,
     e: &pck::Entry,
     output: &Path,
     lua_key: Option<&[u8]>,
@@ -429,13 +440,10 @@ fn extract_entry(
         Vec::new()
     } else {
         let mut buf = vec![0u8; e.comp_size as usize];
-        {
-            let mut f = shared.lock().unwrap();
-            f.seek(SeekFrom::Start(e.data_offset))
-                .with_context(|| format!("seek {} 失败", e.name))?;
-            f.read_exact(&mut buf)
-                .with_context(|| format!("读取 {} 数据失败", e.name))?;
-        }
+        file.seek(SeekFrom::Start(e.data_offset))
+            .with_context(|| format!("seek {} 失败", e.name))?;
+        file.read_exact(&mut buf)
+            .with_context(|| format!("读取 {} 数据失败", e.name))?;
         let mut out = Vec::with_capacity(e.raw_size as usize);
         flate2::read::ZlibDecoder::new(&buf[..])
             .read_to_end(&mut out)

@@ -28,8 +28,12 @@ jiuyin-unpack --all-patches <游戏安装目录> [OPTIONS]
                           ../updater/fxupdate.exe → ../bin64/fxgame.exe）
       --list             仅列出条目（路径、压缩/原始大小、时间戳、目标包名）
       --no-lua-decrypt   跳过 Lua 字节码解密，写出原始数据
-  -j, --jobs <N>         并行线程数（默认：CPU 核数）
+  -j, --jobs <N>         并行线程数（默认：运行时逻辑 CPU 核数，自动适配；
+                         实际线程数会在解包开始时打印）
 ```
+
+多线程说明：条目解压/解密/写出按 rayon 线程池并行，每个工作线程持有独立的
+包文件句柄（读 I/O 无全局锁）；包与包之间在批量模式下按顺序推进。
 
 示例：
 
