@@ -1,0 +1,17 @@
+[package]
+name = "jiuyin-unpack"
+version = "0.1.0"
+edition = "2021"
+description = "九阴真经 .package/.patch 资源包命令行解包工具"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+encoding_rs = "0.8"
+flate2 = "1"
+indicatif = "0.17"
+rayon = "1"
+
+[profile.release]
+lto = true
