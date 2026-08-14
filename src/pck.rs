@@ -58,7 +58,6 @@ impl Entry {
 pub struct Package {
     pub header: Header,
     pub entries: Vec<Entry>,
-    pub file_len: u64,
 }
 
 /// 从 reader（已打开的 .package/.patch 文件）解析头部与全部条目。
@@ -142,7 +141,6 @@ pub fn parse<R: Read>(mut reader: R, file_len: u64) -> Result<Package> {
     Ok(Package {
         header,
         entries,
-        file_len,
     })
 }
 
