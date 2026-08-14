@@ -92,9 +92,10 @@ fn longest_printable_run(data: &[u8]) -> (usize, usize) {
     best
 }
 
-/// 相对 package 文件自动探测启动器/客户端 exe（向上最多 3 级目录）。
-pub fn find_launcher(package: &Path) -> Option<PathBuf> {
-    let mut base = package.parent()?;
+/// 在 anchor 目录及其上级（最多 3 级）自动探测启动器/客户端 exe。
+/// anchor 为游戏安装目录（批量模式）或包文件所在目录（单包模式）。
+pub fn find_launcher(anchor: &Path) -> Option<PathBuf> {
+    let mut base = anchor;
     for _ in 0..3 {
         for rel in [
             "updater_/fxupdate.exe",

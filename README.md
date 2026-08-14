@@ -12,12 +12,17 @@
 
 ```text
 jiuyin-unpack <PACKAGE> [OPTIONS]
+jiuyin-unpack --all-packages <游戏安装目录> [OPTIONS]
+jiuyin-unpack --all-patches <游戏安装目录> [OPTIONS]
 
 参数：
-  <PACKAGE>              .package 或 .patch 文件路径
+  <PACKAGE>              .package 或 .patch 文件路径（三选一）
 
 选项：
-  -o, --output <DIR>     输出目录（默认：./<包名去后缀>_unpacked）
+  --all-packages <DIR>   递归解包该目录下所有 .package 文件
+  --all-patches <DIR>    递归解包该目录下所有 .patch 文件（两者可同时指定）
+  -o, --output <DIR>     输出目录（单包默认：./<包名>_unpacked；
+                         批量默认：./<目录名>_packages|patches_unpacked）
   -l, --launcher <EXE>   用于提取解密密钥的启动器/客户端 exe
                          （默认自动探测：../updater_/fxupdate.exe →
                           ../updater/fxupdate.exe → ../bin64/fxgame.exe）
@@ -35,8 +40,11 @@ jiuyin-unpack --list "D:\游戏蜗牛\9yinjh\res\eff.package"
 # 解包到指定目录（密钥自动从启动器提取）
 jiuyin-unpack "D:\游戏蜗牛\9yinjh\res\lua.package" -o D:\out\lua
 
-# 解包增量补丁（按目标包名分目录）
-jiuyin-unpack "D:\游戏蜗牛\9yinjh\patch\jyzj-1.0.2.585-1.0.2.586.patch" -o D:\out\patch
+# 批量：解包安装目录下全部 .package（递归，统一进度条，按相对路径分目录）
+jiuyin-unpack --all-packages "D:\游戏蜗牛\9yinjh" -o D:\out\all
+
+# 批量：解包全部 .patch（可同时指定 --all-packages 一起跑）
+jiuyin-unpack --all-patches "D:\游戏蜗牛\9yinjh\patch" -o D:\out\patches
 
 # 指定另一个密钥来源
 jiuyin-unpack "D:\游戏蜗牛\9yinjh\updater_\updater_lua.package" -l "D:\游戏蜗牛\9yinjh\bin64\fxgame.exe" -o D:\out\ulua
@@ -44,6 +52,10 @@ jiuyin-unpack "D:\游戏蜗牛\9yinjh\updater_\updater_lua.package" -l "D:\游�
 
 `.patch` 条目携带目标包名（如 `res\share.package`），输出组织为
 `<out>/<目标包名>/<条目路径>`；散文件（如 `version.ini`）直接落在 `<out>` 下。
+批量模式按包文件在扫描根目录下的**相对路径**分目录（如
+`out/res/lua.package/...`、`out/patch/xxx.patch/...`），因此
+`updater\` 与 `updater_\` 下的同名包不会互相覆盖；个别包解析失败会跳过并在
+汇总中计数，不影响其余包。
 
 ## 格式分析
 
@@ -53,7 +65,8 @@ jiuyin-unpack "D:\游戏蜗牛\9yinjh\updater_\updater_lua.package" -l "D:\游�
 头部 19 字节（条目区从 0x13 开始）:
   0x00  char[4]  魔数 "PCK0"
   0x04  u16      版本 = 15
-  0x06  u8[4]    保留 = 0
+  0x06  u16      标志：0 = 明文索引；4 = 索引区整体加密（新补丁格式）
+  0x08  u16      保留 = 0
   0x0A  u32      条目数
   0x0E  u32      索引结束偏移（= 数据区起点）
   0x12  u8       0
@@ -70,6 +83,15 @@ jiuyin-unpack "D:\游戏蜗牛\9yinjh\updater_\updater_lua.package" -l "D:\游�
 
 数据区：逐条目独立的标准 zlib 流（78 9C），无容器层加密。
 ```
+
+### 关于索引加密的新补丁格式（暂不支持）
+
+2026-05 前后的补丁（实测 1.0.2.596-597 起）头部标志为 4，索引区（0x13 至
+索引结束偏移）整体被加密，数据块仍为明文 zlib（首块 `version.ini` 可直接
+解压验证）。已排除的加密方式：523 字节密钥的连续/旋转 XOR、按记录重置 XOR、
+exe 内全部可打印串作 XOR/RC4 密钥。破解需要逆向加壳的更新器
+（`fxupdate.exe`），故当前版本遇到此类包会给出明确报错并跳过
+（实测 17 个补丁中 12 个可正常解包，5 个为新格式）。
 
 ### Lua 5.1 字节码 XOR 层（唯一加密）
 
@@ -104,6 +126,8 @@ jiuyin-unpack "D:\游戏蜗牛\9yinjh\updater_\updater_lua.package" -l "D:\游�
 | `updater_/updater_lua.package` | 11 | 全部成功，11 个 Lua 解密（size_t=8） |
 | `updater_/updater_res.package` | 572 | 全部成功，PNG 完好 |
 | `patch/jyzj-1.0.2.585-1.0.2.586.patch` | 6 | 全部成功，按目标包名分目录 |
+| 批量 `--all-packages`（整个安装目录） | 58 包 | 全部解析并可解包（res + updater + updater_） |
+| 批量 `--all-patches`（patch 目录） | 17 包 | 12 个成功，5 个为索引加密新格式被跳过 |
 
 `-l bin64\fxgame.exe` 与默认 `fxupdate.exe` 提取的密钥解密结果逐字节一致；
 游戏目录全程零写入（工具亦内置输出目录防护，拒绝向包所在目录树输出）。

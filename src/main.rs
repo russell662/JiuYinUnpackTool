@@ -24,13 +24,21 @@ const MAX_ENTRY_COMP: u64 = 512 * 1024 * 1024;
 )]
 struct Args {
     /// .package 或 .patch 文件路径
-    package: PathBuf,
+    package: Option<PathBuf>,
 
-    /// 输出目录（默认：./<包名去后缀>）
+    /// 递归解包该目录下所有 .package 文件
+    #[arg(long, value_name = "DIR")]
+    all_packages: Option<PathBuf>,
+
+    /// 递归解包该目录下所有 .patch 文件
+    #[arg(long, value_name = "DIR")]
+    all_patches: Option<PathBuf>,
+
+    /// 输出目录（单包默认：./<包名>_unpacked；批量默认：./<目录名>_packages|patches_unpacked）
     #[arg(short, long, value_name = "DIR")]
     output: Option<PathBuf>,
 
-    /// 用于提取 Lua 解密密钥的启动器/客户端 exe（默认自动探测）
+    /// 用于提取 Lua 解密密钥的启动器/客户端 exe（默认按安装目录自动探测）
     #[arg(short, long, value_name = "EXE")]
     launcher: Option<PathBuf>,
 
@@ -56,6 +64,7 @@ fn main() {
 }
 
 fn run(args: &Args) -> Result<()> {
+    validate_modes(args)?;
     if let Some(j) = args.jobs {
         rayon::ThreadPoolBuilder::new()
             .num_threads(j)
@@ -63,17 +72,43 @@ fn run(args: &Args) -> Result<()> {
             .context("初始化线程池失败")?;
     }
 
-    let file_len = std::fs::metadata(&args.package)
-        .with_context(|| format!("打开 {} 失败", args.package.display()))?
-        .len();
-    let mut reader = File::open(&args.package)
-        .with_context(|| format!("打开 {} 失败", args.package.display()))?;
-    let pkg = pck::parse(&mut reader, file_len)
-        .with_context(|| format!("解析 {} 失败", args.package.display()))?;
+    if let Some(package) = &args.package {
+        return run_single(args, package);
+    }
+
+    // 批量模式：--all-packages 与 --all-patches 可同时指定（各自扫描）。
+    let mut failures = 0usize;
+    if let Some(root) = &args.all_packages {
+        failures += run_batch(args, root, "package")?;
+    }
+    if let Some(root) = &args.all_patches {
+        failures += run_batch(args, root, "patch")?;
+    }
+    if failures > 0 {
+        bail!("批量解包共 {failures} 个条目失败");
+    }
+    Ok(())
+}
+
+fn validate_modes(args: &Args) -> Result<()> {
+    let has_batch = args.all_packages.is_some() || args.all_patches.is_some();
+    if args.package.is_none() && !has_batch {
+        bail!("必须指定 <PACKAGE>、--all-packages <目录> 或 --all-patches <目录> 之一（-h 查看帮助）");
+    }
+    if args.package.is_some() && has_batch {
+        bail!("<PACKAGE> 不能与 --all-packages/--all-patches 同时使用");
+    }
+    Ok(())
+}
+
+// ---------- 单包模式 ----------
+
+fn run_single(args: &Args, package: &Path) -> Result<()> {
+    let pkg = open_package(package)?;
     println!(
         "包：{}（{} 字节）  版本 {}  条目 {}  数据区 @ {}",
-        args.package.display(),
-        file_len,
+        package.display(),
+        pkg_file_len(package)?,
         pkg.header.version,
         pkg.entries.len(),
         pkg.header.index_end
@@ -87,34 +122,157 @@ fn run(args: &Args) -> Result<()> {
     let output = args
         .output
         .clone()
-        .unwrap_or_else(|| default_output(&args.package));
-    ensure_output_safe(&output, &args.package)?;
+        .unwrap_or_else(|| default_single_output(package));
+    ensure_output_safe(&output, package)?;
 
-    // Lua 解密密钥：从启动器二进制静态提取（无需启动游戏）。
-    let lua_key = if args.no_lua_decrypt {
-        None
-    } else {
-        match resolve_key(&args.launcher, &args.package) {
-            Ok(Some((k, src))) => {
-                println!("Lua 密钥：{src}（{} 字节）", k.len());
-                Some(k)
-            }
-            Ok(None) => {
-                println!("已指定 --no-lua-decrypt，跳过 Lua 字节码解密");
-                None
-            }
-            Err(e) => {
-                eprintln!("警告：{e:#}");
-                eprintln!("未获得密钥，Lua 条目将保持原始数据继续解包");
-                None
-            }
-        }
-    };
+    let lua_key = resolve_key(&args.launcher, package.parent(), args.no_lua_decrypt);
 
-    extract_all(&args.package, &pkg, &output, lua_key.as_deref())
+    let pb = new_progress_bar(pkg.entries.len() as u64);
+    let summary = extract_all(&pb, "", package, &pkg, &output, lua_key.as_deref())?;
+    pb.finish_and_clear();
+    print_summary(&output, &summary);
+    if !summary.errors.is_empty() {
+        print_errors(&summary);
+        bail!("有 {} 个条目解包失败", summary.errors.len());
+    }
+    Ok(())
 }
 
-fn default_output(package: &Path) -> PathBuf {
+// ---------- 批量模式 ----------
+
+/// 递归扫描 root 下指定扩展名的包文件（大小写不敏感），按路径排序。
+fn scan_packages(root: &Path, ext: &str) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    fn walk(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            // 不跟随符号链接（file_type 基于目录项本身），避免循环遍历。
+            if entry.file_type()?.is_dir() {
+                walk(&path, ext, out)?;
+            } else if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+            {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+    walk(root, ext, &mut found)
+        .with_context(|| format!("扫描目录 {} 失败", root.display()))?;
+    found.sort();
+    Ok(found)
+}
+
+fn run_batch(args: &Args, root: &Path, kind: &str) -> Result<usize> {
+    let files = scan_packages(root, kind)?;
+    if files.is_empty() {
+        bail!("在 {} 下未找到任何 .{kind} 文件", root.display());
+    }
+    println!(
+        "批量模式（.{kind}）：{} 个包，根目录 {}",
+        files.len(),
+        root.display()
+    );
+
+    // 全部先解析（仅读头部与索引），既提前暴露损坏/不支持格式，也便于统一进度条。
+    let mut parsed: Vec<(PathBuf, pck::Package)> = Vec::new();
+    let mut skipped = 0usize;
+    for f in &files {
+        match open_package(f) {
+            Ok(pkg) => parsed.push((f.clone(), pkg)),
+            Err(e) => {
+                skipped += 1;
+                eprintln!("跳过 {}：{e:#}", f.display());
+            }
+        }
+    }
+    if parsed.is_empty() {
+        bail!("根目录下没有可解析的 .{kind} 文件（{skipped} 个被跳过）");
+    }
+    if args.list {
+        for (i, (path, pkg)) in parsed.iter().enumerate() {
+            println!(
+                "\n[{}/{}] {}（{} 字节）  条目 {}",
+                i + 1,
+                parsed.len(),
+                path.display(),
+                pkg_file_len(path)?,
+                pkg.entries.len()
+            );
+            list_entries(pkg);
+        }
+        return Ok(0);
+    }
+
+    let output = args.output.clone().unwrap_or_else(|| default_batch_output(root, kind));
+    ensure_output_safe(&output, root)?;
+
+    let lua_key = resolve_key(&args.launcher, Some(root), args.no_lua_decrypt);
+
+    let total_entries: u64 = parsed.iter().map(|(_, p)| p.entries.len() as u64).sum();
+    let pb = new_progress_bar(total_entries);
+    let mut total_failures = 0usize;
+    let mut total_bytes = 0u64;
+    let mut total_lua = 0usize;
+    for (i, (path, pkg)) in parsed.iter().enumerate() {
+        // 按包在安装目录下的相对路径分目录，避免 updater/ 与 updater_/ 等同名包互相覆盖。
+        let rel = path.strip_prefix(root).unwrap_or(path.as_path());
+        let dest = pck::safe_output_path(&output, &rel.to_string_lossy());
+        let prefix = format!("[{}/{}] ", i + 1, parsed.len());
+        let summary = match extract_all(&pb, &prefix, path, pkg, &dest, lua_key.as_deref()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{prefix}{} — 打开失败：{e:#}", rel.display());
+                total_failures += pkg.entries.len();
+                continue;
+            }
+        };
+        println!(
+            "{prefix}{} — {}/{} 成功（{} 字节），Lua 解密 {}",
+            rel.display(),
+            summary.ok,
+            summary.total,
+            summary.bytes,
+            summary.lua_ok
+        );
+        if !summary.errors.is_empty() {
+            print_errors(&summary);
+        }
+        total_failures += summary.errors.len();
+        total_bytes += summary.bytes;
+        total_lua += summary.lua_ok;
+    }
+    pb.finish_and_clear();
+    println!(
+        "\n批量完成：{} 个包（另跳过 {skipped} 个），输出目录 {}，解压 {} 字节，Lua 解密 {} 个，失败 {} 个条目",
+        parsed.len(),
+        output.display(),
+        total_bytes,
+        total_lua,
+        total_failures
+    );
+    Ok(total_failures + skipped)
+}
+
+// ---------- 公共流程 ----------
+
+fn open_package(package: &Path) -> Result<pck::Package> {
+    let file_len = pkg_file_len(package)?;
+    let mut reader =
+        File::open(package).with_context(|| format!("打开 {} 失败", package.display()))?;
+    pck::parse(&mut reader, file_len)
+        .with_context(|| format!("解析 {} 失败", package.display()))
+}
+
+fn pkg_file_len(package: &Path) -> Result<u64> {
+    std::fs::metadata(package)
+        .with_context(|| format!("打开 {} 失败", package.display()))
+        .map(|m| m.len())
+}
+
+fn default_single_output(package: &Path) -> PathBuf {
     let stem = package
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -122,22 +280,36 @@ fn default_output(package: &Path) -> PathBuf {
     PathBuf::from(format!("{stem}_unpacked"))
 }
 
+fn default_batch_output(root: &Path, kind: &str) -> PathBuf {
+    let name = root
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "install".to_string());
+    PathBuf::from(format!("{name}_{kind}s_unpacked"))
+}
+
 /// 拒绝把输出放进包文件所在目录树内（避免写入游戏安装目录）。
-fn ensure_output_safe(output: &Path, package: &Path) -> Result<()> {
+/// guard_base 为单包模式的包目录，或批量模式的扫描根目录。
+fn ensure_output_safe(output: &Path, guard_base_file_or_dir: &Path) -> Result<()> {
     let out_abs = std::path::absolute(output)
         .with_context(|| format!("输出路径非法：{}", output.display()))?;
-    let pkg_dir = package
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let pkg_dir_abs = std::path::absolute(pkg_dir)
-        .with_context(|| format!("包路径非法：{}", package.display()))?;
+    let base = if guard_base_file_or_dir.is_dir() {
+        guard_base_file_or_dir.to_path_buf()
+    } else {
+        guard_base_file_or_dir
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf()
+    };
+    let base_abs = std::path::absolute(&base)
+        .with_context(|| format!("路径非法：{}", base.display()))?;
     let norm = |p: &Path| p.to_string_lossy().to_lowercase().replace('/', "\\");
-    if norm(&out_abs).starts_with(&norm(&pkg_dir_abs)) {
+    if norm(&out_abs).starts_with(&norm(&base_abs)) {
         bail!(
-            "输出目录 {} 位于包文件所在目录 {} 内（游戏目录只读，请用 -o 指定其他位置）",
+            "输出目录 {} 位于 {} 内（游戏目录只读，请用 -o 指定其他位置）",
             out_abs.display(),
-            pkg_dir_abs.display()
+            base_abs.display()
         );
     }
     Ok(())
@@ -145,19 +317,50 @@ fn ensure_output_safe(output: &Path, package: &Path) -> Result<()> {
 
 fn resolve_key(
     launcher: &Option<PathBuf>,
-    package: &Path,
-) -> Result<Option<(Vec<u8>, String)>> {
+    anchor_dir: Option<&Path>,
+    no_lua_decrypt: bool,
+) -> Option<Vec<u8>> {
+    if no_lua_decrypt {
+        println!("已指定 --no-lua-decrypt，跳过 Lua 字节码解密");
+        return None;
+    }
+    let anchor = anchor_dir.unwrap_or(Path::new("."));
     let path = match launcher {
         Some(p) => p.clone(),
-        None => key::find_launcher(package).ok_or_else(|| {
-            anyhow::anyhow!(
-                "未自动探测到启动器（尝试过 ../updater_/fxupdate.exe 等），请用 -l 指定 fxupdate.exe 或 fxgame.exe"
-            )
-        })?,
+        None => match key::find_launcher(anchor) {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "警告：未自动探测到启动器（尝试过 ../updater_/fxupdate.exe 等），请用 -l 指定 fxupdate.exe 或 fxgame.exe"
+                );
+                eprintln!("未获得密钥，Lua 条目将保持原始数据继续解包");
+                return None;
+            }
+        },
     };
-    let (k, note) = key::extract_key(&path)?;
-    let src = format!("{}（{}）", path.display(), note);
-    Ok(Some((k, src)))
+    match key::extract_key(&path) {
+        Ok((k, note)) => {
+            println!("Lua 密钥：{note}（{}，{} 字节）", path.display(), k.len());
+            Some(k)
+        }
+        Err(e) => {
+            eprintln!("警告：{e:#}");
+            eprintln!("未获得密钥，Lua 条目将保持原始数据继续解包");
+            None
+        }
+    }
+}
+
+fn new_progress_bar(len: u64) -> ProgressBar {
+    let pb = ProgressBar::new(len);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:38.cyan/blue}] {pos}/{len} ({percent}%) {bytes_per_sec} {msg}",
+        )
+        .unwrap()
+        .progress_chars("##-"),
+    );
+    pb
 }
 
 fn list_entries(pkg: &pck::Package) {
@@ -174,86 +377,95 @@ fn list_entries(pkg: &pck::Package) {
     }
 }
 
+/// 单个包（或批量中的单个包）的解包统计。
+struct PackageSummary {
+    total: usize,
+    ok: usize,
+    lua_ok: usize,
+    lua_fallback: usize,
+    bytes: u64,
+    errors: Vec<(String, String)>,
+}
+
 fn extract_all(
+    pb: &ProgressBar,
+    msg_prefix: &str,
     package_path: &Path,
     pkg: &pck::Package,
     output: &Path,
     lua_key: Option<&[u8]>,
-) -> Result<()> {
+) -> Result<PackageSummary> {
     let shared = Mutex::new(
-        File::open(package_path)
-            .with_context(|| format!("打开 {} 失败", package_path.display()))?,
+        File::open(package_path).with_context(|| format!("打开 {} 失败", package_path.display()))?,
     );
-    let pb = ProgressBar::new(pkg.entries.len() as u64);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:38.cyan/blue}] {pos}/{len} ({percent}%) {bytes_per_sec} {msg}",
-        )
-        .unwrap()
-        .progress_chars("##-"),
-    );
-
     let results: Vec<(String, Result<Outcome>)> = pkg
         .entries
         .par_iter()
         .map(|e| {
             let r = extract_entry(&shared, e, output, lua_key);
             if let Ok(o) = &r {
-                pb.set_message(format!("{} ({})", truncate(&e.name, 40), o.label()));
+                pb.set_message(format!(
+                    "{msg_prefix}{} ({})",
+                    truncate(&e.name, 40),
+                    o.label()
+                ));
             }
             pb.inc(1);
             (e.name.clone(), r)
         })
         .collect();
 
-    pb.finish_and_clear();
-
-    let mut ok = 0usize;
-    let mut lua_ok = 0usize;
-    let mut lua_fallback = 0usize;
-    let mut errors = Vec::new();
-    let mut total_bytes = 0u64;
+    let mut s = PackageSummary {
+        total: pkg.entries.len(),
+        ok: 0,
+        lua_ok: 0,
+        lua_fallback: 0,
+        bytes: 0,
+        errors: Vec::new(),
+    };
     for (name, r) in results {
         match r {
             Ok(Outcome::Plain(n)) => {
-                ok += 1;
-                total_bytes += n;
+                s.ok += 1;
+                s.bytes += n;
             }
             Ok(Outcome::Lua(n)) => {
-                ok += 1;
-                total_bytes += n;
-                lua_ok += 1;
+                s.ok += 1;
+                s.bytes += n;
+                s.lua_ok += 1;
             }
             Ok(Outcome::LuaFallbackRaw) => {
-                ok += 1;
-                lua_fallback += 1;
+                s.ok += 1;
+                s.lua_fallback += 1;
             }
-            Err(e) => errors.push((name, e)),
+            Err(e) => s.errors.push((name, format!("{e:#}"))),
         }
     }
+    Ok(s)
+}
 
+fn print_summary(output: &Path, s: &PackageSummary) {
     println!("输出目录：{}", output.display());
     println!(
-        "完成：{}/{} 成功（解压 {total_bytes} 字节），其中 Lua 解密 {lua_ok} 个",
-        ok,
-        pkg.entries.len()
+        "完成：{}/{} 成功（解压 {} 字节），其中 Lua 解密 {} 个",
+        s.ok, s.total, s.bytes, s.lua_ok
     );
-    if lua_fallback > 0 {
+    if s.lua_fallback > 0 {
         println!(
-            "警告：{lua_fallback} 个 Lua 条目解密失败，已按原始数据写出（可能是密钥不匹配）"
+            "警告：{} 个 Lua 条目解密失败，已按原始数据写出（可能是密钥不匹配）",
+            s.lua_fallback
         );
     }
-    if !errors.is_empty() {
-        eprintln!("失败 {} 个：", errors.len());
-        for (name, e) in errors.iter().take(20) {
-            eprintln!("  {name}: {e:#}");
-        }
-        if errors.len() > 20 {
-            eprintln!("  …… 其余 {} 个略", errors.len() - 20);
-        }
-        bail!("有 {} 个条目解包失败", errors.len());
+}
+
+fn print_errors(s: &PackageSummary) {
+    eprintln!("失败 {} 个：", s.errors.len());
+    for (name, e) in s.errors.iter().take(20) {
+        eprintln!("  {name}: {e}");
     }
-    Ok(())
+    if s.errors.len() > 20 {
+        eprintln!("  …… 其余 {} 个略", s.errors.len() - 20);
+    }
 }
 
 enum Outcome {
@@ -346,5 +558,78 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         let t: String = s.chars().take(n).collect();
         format!("{t}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_finds_nested_packages_case_insensitive() {
+        let root = std::env::temp_dir().join(format!(
+            "jyu_scan_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mk = |rel: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"").unwrap();
+        };
+        mk("res/eff.package");
+        mk("res/map_mdl.package");
+        mk("res/sub/UPPER.PACKAGE");
+        mk("updater_/updater_lua.package");
+        mk("patch/a.patch");
+        mk("patch/b.PATCH");
+        mk("res/not_a_package.txt");
+        mk("res/package_readme.md");
+
+        let pkgs = scan_packages(&root, "package").unwrap();
+        let names: Vec<_> = pkgs
+            .iter()
+            .map(|p| p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "res/eff.package",
+                "res/map_mdl.package",
+                "res/sub/UPPER.PACKAGE",
+                "updater_/updater_lua.package",
+            ]
+        );
+        let patches = scan_packages(&root, "patch").unwrap();
+        assert_eq!(patches.len(), 2);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn mode_validation() {
+        let mut args = Args {
+            package: None,
+            all_packages: None,
+            all_patches: None,
+            output: None,
+            launcher: None,
+            list: false,
+            no_lua_decrypt: false,
+            jobs: None,
+        };
+        assert!(validate_modes(&args).is_err());
+        args.package = Some(PathBuf::from("a.package"));
+        assert!(validate_modes(&args).is_ok());
+        args.all_packages = Some(PathBuf::from("dir"));
+        assert!(validate_modes(&args).is_err());
+        args.package = None;
+        assert!(validate_modes(&args).is_ok());
+        args.all_patches = Some(PathBuf::from("dir"));
+        assert!(validate_modes(&args).is_ok());
+        args.output = Some(PathBuf::from("out"));
+        assert!(validate_modes(&args).is_ok()); // 双批量共用 -o 无冲突（输出按相对路径区分）
     }
 }

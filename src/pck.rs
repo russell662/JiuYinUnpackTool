@@ -24,6 +24,9 @@ pub const SUPPORTED_VERSION: u16 = 15;
 #[derive(Debug, Clone)]
 pub struct Header {
     pub version: u16,
+    /// 头部 0x06 处的标志字：0 = 明文索引（旧格式）；
+    /// 4 = 索引区整体加密（2026-05 起的新补丁格式，暂不支持）。
+    pub flags: u16,
     pub entry_count: u32,
     /// 索引区结束偏移，同时是数据区起点。
     pub index_end: u64,
@@ -75,11 +78,18 @@ pub fn parse<R: Read>(mut reader: R, file_len: u64) -> Result<Package> {
     }
     let header = Header {
         version: u16::from_le_bytes([head[4], head[5]]),
+        flags: u16::from_le_bytes([head[6], head[7]]),
         entry_count: u32::from_le_bytes([head[0x0A], head[0x0B], head[0x0C], head[0x0D]]),
         index_end: u32::from_le_bytes([head[0x0E], head[0x0F], head[0x10], head[0x11]]) as u64,
     };
     if header.version != SUPPORTED_VERSION {
         bail!("不支持的 PCK0 版本 {}（仅支持 15）", header.version);
+    }
+    if header.flags != 0 {
+        bail!(
+            "该包使用索引加密的新格式（头部标志 = {}，明文索引格式标志为 0），暂不支持",
+            header.flags
+        );
     }
     if header.index_end < HEADER_SIZE as u64 || header.index_end > file_len {
         bail!(
@@ -189,7 +199,12 @@ fn memchr(buf: &[u8], b: u8) -> Option<usize> {
 pub fn decode_gbk(bytes: &[u8]) -> String {
     let (cow, _, had_errors) = encoding_rs::GBK.decode(bytes);
     if had_errors {
-        eprintln!("警告：文件名含非法 GBK 序列：{:02X?}", bytes);
+        let head: Vec<String> = bytes.iter().take(32).map(|b| format!("{b:02X}")).collect();
+        eprintln!(
+            "警告：文件名含非法 GBK 序列（前 32 字节：{}…，共 {} 字节）",
+            head.join(" "),
+            bytes.len()
+        );
     }
     cow.into_owned()
 }

@@ -1,6 +1,6 @@
 [package]
 name = "jiuyin-unpack"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "九阴真经 .package/.patch 资源包命令行解包工具"
 license = "MIT"
