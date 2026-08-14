@@ -1,12 +1,11 @@
-//! jiuyin-unpack：九阴真经 .package/.patch 命令行解包工具。
-
-mod key;
-mod lua;
-mod pck;
+//! jiuyin-unpack 可执行入口：CLI 编排、进度条、并行解包与汇总。
+//! 格式解析与算法实现见 `src/lib.rs`（crate `jiuyin_unpack`），测试见 `tests/`。
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
+use jiuyin_unpack::cli::{scan_packages, validate_modes, Args};
+use jiuyin_unpack::{key, lua, pck};
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -15,45 +14,6 @@ use std::sync::Mutex;
 
 /// 单条目压缩块读取上限（防御异常索引；实测条目远小于此值）。
 const MAX_ENTRY_COMP: u64 = 512 * 1024 * 1024;
-
-#[derive(Parser)]
-#[command(
-    name = "jiuyin-unpack",
-    version,
-    about = "九阴真经 .package/.patch 资源包解包工具（PCK0 + zlib + Lua 字节码去混淆）"
-)]
-struct Args {
-    /// .package 或 .patch 文件路径
-    package: Option<PathBuf>,
-
-    /// 递归解包该目录下所有 .package 文件
-    #[arg(long, value_name = "DIR")]
-    all_packages: Option<PathBuf>,
-
-    /// 递归解包该目录下所有 .patch 文件
-    #[arg(long, value_name = "DIR")]
-    all_patches: Option<PathBuf>,
-
-    /// 输出目录（单包默认：./<包名>_unpacked；批量默认：./<目录名>_packages|patches_unpacked）
-    #[arg(short, long, value_name = "DIR")]
-    output: Option<PathBuf>,
-
-    /// 用于提取 Lua 解密密钥的启动器/客户端 exe（默认按安装目录自动探测）
-    #[arg(short, long, value_name = "EXE")]
-    launcher: Option<PathBuf>,
-
-    /// 仅列出包内条目，不解包
-    #[arg(long)]
-    list: bool,
-
-    /// 跳过 Lua 字节码解密，写出 zlib 解压后的原始数据
-    #[arg(long)]
-    no_lua_decrypt: bool,
-
-    /// 并行线程数（默认：CPU 核数）
-    #[arg(short, long, value_name = "N")]
-    jobs: Option<usize>,
-}
 
 fn main() {
     let args = Args::parse();
@@ -85,18 +45,7 @@ fn run(args: &Args) -> Result<()> {
         failures += run_batch(args, root, "patch")?;
     }
     if failures > 0 {
-        bail!("批量解包共 {failures} 个条目失败");
-    }
-    Ok(())
-}
-
-fn validate_modes(args: &Args) -> Result<()> {
-    let has_batch = args.all_packages.is_some() || args.all_patches.is_some();
-    if args.package.is_none() && !has_batch {
-        bail!("必须指定 <PACKAGE>、--all-packages <目录> 或 --all-patches <目录> 之一（-h 查看帮助）");
-    }
-    if args.package.is_some() && has_batch {
-        bail!("<PACKAGE> 不能与 --all-packages/--all-patches 同时使用");
+        bail!("批量解包共 {failures} 个条目/包失败");
     }
     Ok(())
 }
@@ -140,31 +89,6 @@ fn run_single(args: &Args, package: &Path) -> Result<()> {
 
 // ---------- 批量模式 ----------
 
-/// 递归扫描 root 下指定扩展名的包文件（大小写不敏感），按路径排序。
-fn scan_packages(root: &Path, ext: &str) -> Result<Vec<PathBuf>> {
-    let mut found = Vec::new();
-    fn walk(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            // 不跟随符号链接（file_type 基于目录项本身），避免循环遍历。
-            if entry.file_type()?.is_dir() {
-                walk(&path, ext, out)?;
-            } else if path
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case(ext))
-            {
-                out.push(path);
-            }
-        }
-        Ok(())
-    }
-    walk(root, ext, &mut found)
-        .with_context(|| format!("扫描目录 {} 失败", root.display()))?;
-    found.sort();
-    Ok(found)
-}
-
 fn run_batch(args: &Args, root: &Path, kind: &str) -> Result<usize> {
     let files = scan_packages(root, kind)?;
     if files.is_empty() {
@@ -206,7 +130,10 @@ fn run_batch(args: &Args, root: &Path, kind: &str) -> Result<usize> {
         return Ok(0);
     }
 
-    let output = args.output.clone().unwrap_or_else(|| default_batch_output(root, kind));
+    let output = args
+        .output
+        .clone()
+        .unwrap_or_else(|| default_batch_output(root, kind));
     ensure_output_safe(&output, root)?;
 
     let lua_key = resolve_key(&args.launcher, Some(root), args.no_lua_decrypt);
@@ -558,78 +485,5 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         let t: String = s.chars().take(n).collect();
         format!("{t}…")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scan_finds_nested_packages_case_insensitive() {
-        let root = std::env::temp_dir().join(format!(
-            "jyu_scan_test_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mk = |rel: &str| {
-            let p = root.join(rel);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(&p, b"").unwrap();
-        };
-        mk("res/eff.package");
-        mk("res/map_mdl.package");
-        mk("res/sub/UPPER.PACKAGE");
-        mk("updater_/updater_lua.package");
-        mk("patch/a.patch");
-        mk("patch/b.PATCH");
-        mk("res/not_a_package.txt");
-        mk("res/package_readme.md");
-
-        let pkgs = scan_packages(&root, "package").unwrap();
-        let names: Vec<_> = pkgs
-            .iter()
-            .map(|p| p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"))
-            .collect();
-        assert_eq!(
-            names,
-            vec![
-                "res/eff.package",
-                "res/map_mdl.package",
-                "res/sub/UPPER.PACKAGE",
-                "updater_/updater_lua.package",
-            ]
-        );
-        let patches = scan_packages(&root, "patch").unwrap();
-        assert_eq!(patches.len(), 2);
-
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn mode_validation() {
-        let mut args = Args {
-            package: None,
-            all_packages: None,
-            all_patches: None,
-            output: None,
-            launcher: None,
-            list: false,
-            no_lua_decrypt: false,
-            jobs: None,
-        };
-        assert!(validate_modes(&args).is_err());
-        args.package = Some(PathBuf::from("a.package"));
-        assert!(validate_modes(&args).is_ok());
-        args.all_packages = Some(PathBuf::from("dir"));
-        assert!(validate_modes(&args).is_err());
-        args.package = None;
-        assert!(validate_modes(&args).is_ok());
-        args.all_patches = Some(PathBuf::from("dir"));
-        assert!(validate_modes(&args).is_ok());
-        args.output = Some(PathBuf::from("out"));
-        assert!(validate_modes(&args).is_ok()); // 双批量共用 -o 无冲突（输出按相对路径区分）
     }
 }

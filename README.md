@@ -136,17 +136,20 @@ exe 内全部可打印串作 XOR/RC4 密钥。破解需要逆向加壳的更新�
 
 ```bash
 cargo build --release   # 产物 target/release/jiuyin-unpack.exe
-cargo test              # 单元测试（PCK 解析 / Lua 往返解密 / 密钥定位 / 路径清洗）
+cargo test              # 集成测试（tests/：PCK 解析 / Lua 往返解密 / 密钥提取 / 扫描与参数校验）
 ```
 
 ## 项目结构
 
 ```text
 src/
-  main.rs   CLI（clap）、进度条（indicatif）、并行解包（rayon）与汇总
+  lib.rs    库入口（crate jiuyin_unpack）
+  cli.rs    CLI 参数定义（clap）、模式校验、批量目录递归扫描
   pck.rs    PCK0 头/条目解析、GBK 文件名解码、安全输出路径
   key.rs    启动器密钥提取（签名锚点 + 最长可打印串兜底）与自动探测
   lua.rs    Lua 5.1 undump 结构遍历与逐字段去 XOR（含结构校验）
+  main.rs   可执行入口：编排、进度条、并行解包与汇总
+tests/      集成测试（按模块分文件：pck / lua / key / cli）
 ```
 
 仅供学习研究游戏资源格式之用。

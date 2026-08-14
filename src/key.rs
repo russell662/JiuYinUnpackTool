@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
 /// 密钥开头的 16 字节签名锚点（完整密钥从启动器文件中读出）。
-const KEY_SIGNATURE: &[u8] = b"abcd464fghfgfjhf";
+pub const KEY_SIGNATURE: &[u8] = b"abcd464fghfgfjhf";
 /// 实测密钥长度（fxupdate.exe 与 fxgame.exe 中一致）。
 pub const EXPECTED_KEY_LEN: usize = 523;
 const MIN_KEY_LEN: usize = 128;
@@ -60,15 +60,15 @@ pub fn extract_key(path: &Path) -> Result<(Vec<u8>, &'static str)> {
     );
 }
 
-fn is_printable(b: u8) -> bool {
+pub fn is_printable(b: u8) -> bool {
     (0x20..=0x7E).contains(&b)
 }
 
-fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-fn longest_printable_run(data: &[u8]) -> (usize, usize) {
+pub fn longest_printable_run(data: &[u8]) -> (usize, usize) {
     let mut best = (0usize, 0usize);
     let mut run_start = 0usize;
     let mut in_run = false;
@@ -112,30 +112,4 @@ pub fn find_launcher(anchor: &Path) -> Option<PathBuf> {
         base = base.parent()?;
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn signature_hit_extends_to_nul() {
-        let mut exe = vec![0u8; 64];
-        exe.extend_from_slice(b"\x00\x00abcd464fghfgfjhfREST_OF_KEY\x00NEXT_STR");
-        let pos = find_sub(&exe, KEY_SIGNATURE).unwrap();
-        assert_eq!(pos, 66);
-        let end = exe[pos..]
-            .iter()
-            .position(|&b| !is_printable(b))
-            .map(|i| pos + i)
-            .unwrap();
-        assert_eq!(&exe[pos..end], b"abcd464fghfgfjhfREST_OF_KEY");
-    }
-
-    #[test]
-    fn longest_run_fallback() {
-        let data = b"short\x00aaaa\x00this_is_a_very_long_printable_run_for_fallback\x00zz";
-        let (start, len) = longest_printable_run(data);
-        assert_eq!(&data[start..start + len], b"this_is_a_very_long_printable_run_for_fallback");
-    }
 }
