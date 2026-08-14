@@ -151,21 +151,29 @@ fn run_batch(args: &Args, root: &Path, kind: &str) -> Result<usize> {
         let summary = match extract_all(&pb, &prefix, path, pkg, &dest, lua_key.as_deref()) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("{prefix}{} — 打开失败：{e:#}", rel.display());
+                pb.suspend(|| eprintln!("{prefix}{} — 打开失败：{e:#}", rel.display()));
                 total_failures += pkg.entries.len();
                 continue;
             }
         };
-        println!(
-            "{prefix}{} — {}/{} 成功（{} 字节），Lua 解密 {}",
-            rel.display(),
-            summary.ok,
-            summary.total,
-            summary.bytes,
-            summary.lua_ok
-        );
+        // 进度条存活期间的所有输出必须经 suspend，避免破坏单行重绘。
+        let fallback = summary.lua_fallback;
+        let ok = summary.ok;
+        let total = summary.total;
+        let bytes = summary.bytes;
+        let lua_ok = summary.lua_ok;
+        pb.suspend(move || {
+            println!(
+                "{prefix}{} — {ok}/{total} 成功（{bytes} 字节），Lua 解密 {lua_ok} 个",
+                rel.display()
+            );
+            if fallback > 0 {
+                println!("  警告：{fallback} 个 Lua 条目解密失败，已按原始数据写出");
+            }
+        });
         if !summary.errors.is_empty() {
-            print_errors(&summary);
+            let errors = &summary;
+            pb.suspend(move || print_errors(errors));
         }
         total_failures += summary.errors.len();
         total_bytes += summary.bytes;
@@ -282,7 +290,7 @@ fn new_progress_bar(len: u64) -> ProgressBar {
     let pb = ProgressBar::new(len);
     pb.set_style(
         ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:38.cyan/blue}] {pos}/{len} ({percent}%) {bytes_per_sec} {msg}",
+            "{spinner:.green} [{elapsed_precise}] [{bar:30.cyan/blue}] {pos}/{len} ({percent}%) ETA {eta} {wide_msg}",
         )
         .unwrap()
         .progress_chars("##-"),
@@ -330,12 +338,9 @@ fn extract_all(
         .par_iter()
         .map(|e| {
             let r = extract_entry(&shared, e, output, lua_key);
-            if let Ok(o) = &r {
-                pb.set_message(format!(
-                    "{msg_prefix}{} ({})",
-                    truncate(&e.name, 40),
-                    o.label()
-                ));
+            if r.is_ok() {
+                // wide_msg 会按终端宽度自动截断，这里只做粗上限。
+                pb.set_message(format!("{msg_prefix}{}", truncate(&e.name, 48)));
             }
             pb.inc(1);
             (e.name.clone(), r)
@@ -404,16 +409,6 @@ enum Outcome {
     LuaFallbackRaw,
 }
 
-impl Outcome {
-    fn label(&self) -> &'static str {
-        match self {
-            Outcome::Plain(_) => "ok",
-            Outcome::Lua(_) => "lua解密",
-            Outcome::LuaFallbackRaw => "lua原始",
-        }
-    }
-}
-
 fn extract_entry(
     shared: &Mutex<File>,
     e: &pck::Entry,
@@ -463,10 +458,8 @@ fn extract_entry(
                 data = dec;
                 Outcome::Lua(n)
             }
-            Err(err) => {
-                eprintln!("警告：{} Lua 解密失败（{err:#}），写出原始数据", e.name);
-                Outcome::LuaFallbackRaw
-            }
+            // 解密失败不实时打印（会打断进度条重绘），计入汇总统一报告。
+            Err(_) => Outcome::LuaFallbackRaw,
         },
         _ => Outcome::Plain(data.len() as u64),
     };
